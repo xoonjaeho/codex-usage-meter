@@ -30,14 +30,47 @@ Shown at `Stop`, right after the turn ends, so `/compact` or `/new` can be chose
 shows them as `↳ Hook · ...` under the reply. `UserPromptSubmit` never emits a
 message; it only lowers a stored band, so a drop seen at the next prompt (e.g. after `/compact`, which may not fire
 `Stop`) re-arms the warning. Shown once per upward crossing, per session
-(state in `{CODEX_HOME or ~/.codex}/codex-usage-meter/state/`):
+(state in `{CODEX_HOME or ~/.codex}/codex-usage-meter/state/`).
 
-| Source | Bands |
-|---|---|
-| context | 25, 50, 75 |
-| each quota window | 70, 90 |
+Default bands: context 50, 75, 90; each quota window 80, 95. See Configure to change them and the texts.
 
 Input with `agent_id` or without `session_id` gets no message and no state.
+
+## Configure
+
+Optional file `{CODEX_HOME or ~/.codex}/codex-usage-meter.json`, one JSON object, UTF-8 (a BOM is accepted), at most
+64 KiB. A missing file or key means the default. Unknown keys are ignored. All values below are the defaults:
+
+```json
+{
+  "warnings": true,
+  "context_warnings": [
+    {"at": 50, "message": "⚠ Context {pct}% — consider /compact after this task"},
+    {"at": 75, "message": "⚠ Context {pct}% — /compact or start a new session soon"},
+    {"at": 90, "message": "⚠ Context {pct}% — near the limit, /compact now"}
+  ],
+  "quota_warnings": [
+    {"at": 80, "message": "⚠ Codex {window} usage {pct}% — pace your usage (reset: {reset})"},
+    {"at": 95, "message": "⚠ Codex {window} usage {pct}% — nearly used up (reset: {reset})"}
+  ]
+}
+```
+
+- `warnings`: `false` makes `Stop` skip the band warnings and leave band state alone. The usage line is still
+  injected, and config problems are still announced.
+- `context_warnings` / `quota_warnings`: a non-empty list of `{"at", "message"}` objects. `at` is a number from 1 to
+  100 (percent, not boolean) and strictly ascending; `message` is a non-empty string. A message fires when the figure
+  first reaches its `at`.
+- Placeholders: `{pct}` (context with one decimal, quota rounded), `{band}` (the `at` that fired), and for quota
+  messages `{window}` (`5h`, `wk` or `{N}m`) and `{reset}` (the countdown shown in the line, e.g. `2h 10m`, `1d 17h`,
+  `passed`, or `unknown`). Unknown placeholders stay as written; context messages only know `{pct}` and `{band}`.
+
+Fallback rules: an invalid key falls back to its default and never breaks the line. A file that is larger than
+64 KiB, not valid JSON or not an object means all defaults; an unreadable file means all defaults without a notice.
+When a key (or the whole file) is rejected, `Stop` prepends one line per problem to its message, for example
+`codex-usage-meter.json: context_warnings ignored (at must be a number from 1 to 100) — using defaults`. It is shown
+once per session and again only if the set of problems changes. A stored band that is no longer configured reads as
+the highest configured band not above it, or 0.
 
 ## Install
 

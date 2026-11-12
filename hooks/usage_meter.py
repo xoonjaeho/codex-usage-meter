@@ -12,25 +12,27 @@ import re
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 CHUNK_SIZE = 1 << 20
 SCAN_BUDGET = 16 << 20
 ERROR_LINE = "ctx unknown (usage error)"
+CONFIG_NAME = "codex-usage-meter.json"
+CONFIG_LIMIT = 64 << 10
 
-CTX_BANDS = (
-    (75, "stop at a clean point, then /compact or /new"),
-    (50, "/compact after the current task"),
-    (25, "protect: delegate reads, tighten output caps"),
-)
-QUOTA_BANDS = (
-    (90, "orchestrator only, delegate execution"),
-    (70, "prefer engines on another pool"),
-)
 WINDOW_LABELS = {300: "5h", 10080: "wk"}
-CTX_BAND_VALUES = (0, *(t for t, _ in CTX_BANDS))
-QUOTA_BAND_VALUES = (0, *(t for t, _ in QUOTA_BANDS))
+
+DEFAULT_CONTEXT_WARNINGS = [
+    {"at": 50, "message": "⚠ Context {pct}% — consider /compact after this task"},
+    {"at": 75, "message": "⚠ Context {pct}% — /compact or start a new session soon"},
+    {"at": 90, "message": "⚠ Context {pct}% — near the limit, /compact now"},
+]
+DEFAULT_QUOTA_WARNINGS = [
+    {"at": 80, "message": "⚠ Codex {window} usage {pct}% — pace your usage (reset: {reset})"},
+    {"at": 95, "message": "⚠ Codex {window} usage {pct}% — nearly used up (reset: {reset})"},
+]
 
 
 def is_int(value: Any) -> bool:
@@ -38,7 +40,12 @@ def is_int(value: Any) -> bool:
 
 
 def is_finite_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def valid_info(info: Any) -> bool:
@@ -46,6 +53,82 @@ def valid_info(info: Any) -> bool:
         return False
     tokens, window = info["last_token_usage"].get("total_tokens"), info.get("model_context_window")
     return is_int(tokens) and tokens >= 0 and is_int(window) and window > 0
+
+
+def check_bool(value: Any) -> str | None:
+    return None if isinstance(value, bool) else "must be true or false"
+
+
+def check_warnings(value: Any) -> str | None:
+    if not isinstance(value, list) or not value:
+        return "must be a non-empty list of {at, message} objects"
+    previous = 0
+    for entry in value:
+        if not isinstance(entry, dict):
+            return "every entry must be an object"
+        at = entry.get("at")
+        if not is_finite_number(at) or not 1 <= at <= 100:
+            return "at must be a number from 1 to 100"
+        if not isinstance(entry.get("message"), str) or not entry["message"].strip():
+            return "message must be a non-empty string"
+        if at <= previous:
+            return "at values must be strictly ascending"
+        previous = at
+    return None
+
+
+# One row per setting: (default, validator returning a reason or None). A rejected key falls back to its default.
+CONFIG_KEYS: dict[str, tuple[Any, Callable[[Any], str | None]]] = {
+    "warnings": (True, check_bool),
+    "context_warnings": (DEFAULT_CONTEXT_WARNINGS, check_warnings),
+    "quota_warnings": (DEFAULT_QUOTA_WARNINGS, check_warnings),
+}
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def read_config_file() -> tuple[dict, str | None]:
+    """Return (raw settings, reason the whole file was ignored); a missing or unreadable file is not a problem."""
+    try:
+        with open(codex_home() / CONFIG_NAME, "rb") as f:
+            data = f.read(CONFIG_LIMIT + 1)
+    except OSError:
+        return {}, None
+    if len(data) > CONFIG_LIMIT:
+        return {}, "larger than 64 KiB"
+    try:
+        raw = json.loads(data.decode("utf-8-sig"))
+    except (ValueError, RecursionError):
+        return {}, "not valid JSON"
+    if not isinstance(raw, dict):
+        return {}, "not a JSON object"
+    return raw, None
+
+
+def default_config() -> dict[str, Any]:
+    return {**{key: default for key, (default, _) in CONFIG_KEYS.items()}, "problems": []}
+
+
+def load_config() -> dict[str, Any]:
+    """Settings with defaults applied; "problems" lists the notices for rejected keys. Never raises."""
+    try:
+        config = default_config()
+        raw, file_problem = read_config_file()
+        problems = [("config file", file_problem)] if file_problem else []
+        for key, (_, validate) in CONFIG_KEYS.items():
+            if key not in raw:
+                continue
+            reason = validate(raw[key])
+            if reason:
+                problems.append((key, reason))
+            else:
+                config[key] = raw[key]
+        config["problems"] = [f"{CONFIG_NAME}: {key} ignored ({reason}) — using defaults" for key, reason in problems]
+        return config
+    except Exception:
+        return default_config()
 
 
 def valid_window(window: Any) -> bool:
@@ -94,19 +177,24 @@ def scan_rollout(
     return info, limits
 
 
-def format_reset(resets_at: Any, now: float) -> str:
+def reset_text(resets_at: Any, now: float) -> str | None:
     if not is_finite_number(resets_at):
-        return ""
+        return None
     left = resets_at - now
     if left <= 0:
-        return " (reset: passed)"
+        return "passed"
     minutes = round(left / 60)
     days, hours, mins = minutes // 1440, (minutes % 1440) // 60, minutes % 60
     if days:
-        return f" (reset: {days}d {hours}h)"
+        return f"{days}d {hours}h"
     if hours:
-        return f" (reset: {hours}h {mins}m)"
-    return f" (reset: {mins}m)"
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def format_reset(resets_at: Any, now: float) -> str:
+    text = reset_text(resets_at, now)
+    return f" (reset: {text})" if text else ""
 
 
 def quota_label(window: dict) -> str:
@@ -120,60 +208,86 @@ def context_percent(info: dict) -> tuple[float, int, int]:
     return min(tokens, window) / window * 100, tokens, window
 
 
-def build_line(info: dict | None, limits: dict | None, now: float) -> tuple[str, float | None, dict[str, float]]:
-    """Return the usage line, the context percent (None if unknown) and used_percent per quota label."""
+Quota = dict[str, tuple[float, str]]
+
+
+def build_line(info: dict | None, limits: dict | None, now: float) -> tuple[str, float | None, Quota]:
+    """Return the usage line, the context percent (None if unknown) and (used_percent, reset text) per label."""
     if info is None:
         ctx, pct = "ctx unknown", None
     else:
         pct, tokens, window = context_percent(info)
         ctx = f"ctx {pct:.1f}% ({tokens:,} / {window:,})"
     parts: list[str] = []
-    quota: dict[str, float] = {}
+    quota: Quota = {}
     for key in ("primary", "secondary"):
         window_info = (limits or {}).get(key)
         if not valid_window(window_info):
             continue
         label = quota_label(window_info)
         used = window_info["used_percent"]
-        quota[label] = used
+        quota[label] = (used, reset_text(window_info.get("resets_at"), now) or "unknown")
         parts.append(f"{label} {round(used)}%{format_reset(window_info.get('resets_at'), now)}")
     return (f"{ctx} | {' '.join(parts)}" if parts else ctx), pct, quota
 
 
-def band_of(value: float, bands: tuple[tuple[int, str], ...]) -> int:
-    return next((threshold for threshold, _ in bands if value >= threshold), 0)
+def band_of(value: float, thresholds: list) -> float:
+    return max((t for t in thresholds if value >= t), default=0)
 
 
-def advice_for(band: int, bands: tuple[tuple[int, str], ...]) -> str:
-    return next(text for threshold, text in bands if threshold == band)
+def thresholds_of(warnings: list[dict]) -> list:
+    return [w["at"] for w in warnings]
+
+
+def message_for(band: float, warnings: list[dict]) -> str:
+    return next(w["message"] for w in warnings if w["at"] == band)
+
+
+def format_band(band: float) -> str:
+    return f"{band:.10g}"
+
+
+def render(template: str, values: dict[str, str]) -> str:
+    return re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), template)
 
 
 def state_path(session_id: str) -> Path:
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    return home / "codex-usage-meter" / "state" / (re.sub(r"[^A-Za-z0-9._-]", "_", session_id) + ".json")
+    return codex_home() / "codex-usage-meter" / "state" / (re.sub(r"[^A-Za-z0-9._-]", "_", session_id) + ".json")
 
 
-def load_state(path: Path) -> dict:
-    """Return {"ctx": band, "quota": {label: band}}; anything missing or invalid reads as band 0 / no labels."""
+def stored_band(value: Any, thresholds: list) -> float:
+    """Map a stored band onto the current configuration: the highest configured band not above it, else 0."""
+    return band_of(value, thresholds) if is_finite_number(value) else 0
+
+
+def load_state(path: Path, config: dict[str, Any]) -> dict:
+    """Return {"ctx": band, "quota": {label: band}, "announced": [notice]}; invalid parts read as empty."""
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         state = None
     state = state if isinstance(state, dict) else {}
     quota = state.get("quota") if isinstance(state.get("quota"), dict) else {}
+    announced = state.get("announced") if isinstance(state.get("announced"), list) else []
+    ctx_thresholds = thresholds_of(config["context_warnings"])
+    quota_thresholds = thresholds_of(config["quota_warnings"])
     return {
-        "ctx": state["ctx"] if state.get("ctx") in CTX_BAND_VALUES else 0,
-        "quota": {label: band if band in QUOTA_BAND_VALUES else 0 for label, band in quota.items()},
+        "ctx": stored_band(state.get("ctx"), ctx_thresholds),
+        "quota": {label: stored_band(band, quota_thresholds) for label, band in quota.items()},
+        "announced": [a for a in announced if isinstance(a, str)],
     }
 
 
 def save_state(path: Path, state: dict) -> None:
+    content = {"ctx": state["ctx"], "quota": state["quota"]}
+    if state["announced"]:
+        content["announced"] = state["announced"]
     tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f)
+            json.dump(content, f)
         os.replace(tmp, path)
     except OSError:
         if tmp is not None:
@@ -183,45 +297,60 @@ def save_state(path: Path, state: dict) -> None:
                 pass
 
 
-def crossed_messages(session_id: str, pct: float | None, quota: dict[str, float]) -> str:
-    path = state_path(session_id)
-    state = load_state(path)
-    old_quota = state["quota"]
-    new_quota = dict(old_quota)
-    messages: list[str] = []
+def announce_problems(state: dict, problems: list[str]) -> list[str]:
+    """Return the config notices not yet announced in this session, and record the current set."""
+    current = sorted(problems)
+    fresh = list(current) if current != state["announced"] else []
+    state["announced"] = current
+    return fresh
 
+
+def crossed_messages(state: dict, pct: float | None, quota: Quota, config: dict[str, Any]) -> list[str]:
+    messages: list[str] = []
     if pct is not None:
-        band = band_of(pct, CTX_BANDS)
+        warnings = config["context_warnings"]
+        band = band_of(pct, thresholds_of(warnings))
         if band > state["ctx"]:
-            messages.append(f"⚠ ctx {pct:.1f}% crossed — {advice_for(band, CTX_BANDS)}")
+            values = {"pct": f"{pct:.1f}", "band": format_band(band)}
+            messages.append(render(message_for(band, warnings), values))
         state["ctx"] = band
-    for label, used in quota.items():
-        band = band_of(used, QUOTA_BANDS)
-        if band > old_quota.get(label, 0):
-            messages.append(f"⚠ Codex {label} {round(used)}% — {advice_for(band, QUOTA_BANDS)}")
-        new_quota[label] = band
-    state["quota"] = new_quota
+    for label, (used, reset) in quota.items():
+        warnings = config["quota_warnings"]
+        band = band_of(used, thresholds_of(warnings))
+        if band > state["quota"].get(label, 0):
+            values = {"pct": str(round(used)), "band": format_band(band), "window": label, "reset": reset}
+            messages.append(render(message_for(band, warnings), values))
+        state["quota"][label] = band
+    return messages
+
+
+def stop_message(session_id: str, pct: float | None, quota: Quota, config: dict[str, Any]) -> str:
+    path = state_path(session_id)
+    state = load_state(path, config)
+    messages = announce_problems(state, config["problems"])
+    if config["warnings"]:
+        messages += crossed_messages(state, pct, quota, config)
     save_state(path, state)
     return "\n".join(messages)
 
 
-def lower_bands(session_id: str, pct: float | None, quota: dict[str, float]) -> None:
+def lower_bands(session_id: str, pct: float | None, quota: Quota, config: dict[str, Any]) -> None:
     """Re-arm warnings after a drop (e.g. a compaction, which may not fire Stop); never raises a stored band."""
     path = state_path(session_id)
-    state = load_state(path)
+    state = load_state(path, config)
     changed = False
-    if pct is not None and band_of(pct, CTX_BANDS) < state["ctx"]:
-        state["ctx"] = band_of(pct, CTX_BANDS)
+    if pct is not None and band_of(pct, thresholds_of(config["context_warnings"])) < state["ctx"]:
+        state["ctx"] = band_of(pct, thresholds_of(config["context_warnings"]))
         changed = True
-    for label, used in quota.items():
-        if band_of(used, QUOTA_BANDS) < state["quota"].get(label, 0):
-            state["quota"][label] = band_of(used, QUOTA_BANDS)
+    for label, (used, _) in quota.items():
+        if band_of(used, thresholds_of(config["quota_warnings"])) < state["quota"].get(label, 0):
+            state["quota"][label] = band_of(used, thresholds_of(config["quota_warnings"]))
             changed = True
     if changed:
         save_state(path, state)
 
 
-def read_usage(data: dict, now: float) -> tuple[str, float | None, dict[str, float]]:
+def read_usage(data: dict, now: float) -> tuple[str, float | None, Quota]:
     transcript = data.get("transcript_path")
     transcript = transcript if isinstance(transcript, str) else None
     info, limits = scan_rollout(transcript) if transcript else (None, None)
@@ -236,10 +365,19 @@ def prompt_output(data: dict, now: float) -> dict:
     session_id = data.get("session_id")
     if session_id and "agent_id" not in data:
         try:
-            lower_bands(str(session_id), pct, quota)
+            lower_bands(str(session_id), pct, quota, load_config())
         except Exception:
             pass
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": line}}
+
+
+def clear_announced(session_id: str, config: dict[str, Any]) -> None:
+    """Forget announced notices once the problems are gone, so a recurrence is announced again."""
+    path = state_path(session_id)
+    state = load_state(path, config)
+    if state["announced"]:
+        state["announced"] = []
+        save_state(path, state)
 
 
 def stop_output(data: dict, now: float) -> dict:
@@ -247,10 +385,17 @@ def stop_output(data: dict, now: float) -> dict:
     session_id = data.get("session_id")
     if not session_id or "agent_id" in data:
         return {}
-    _, pct, quota = read_usage(data, now)
-    if pct is None and not quota:
+    config = load_config()
+    pct, quota = None, {}
+    if config["warnings"]:
+        try:
+            _, pct, quota = read_usage(data, now)
+        except Exception:  # an unreadable rollout must not hide the config notices
+            pass
+    if pct is None and not quota and not config["problems"]:
+        clear_announced(str(session_id), config)
         return {}
-    message = crossed_messages(str(session_id), pct, quota)
+    message = stop_message(str(session_id), pct, quota, config)
     return {"systemMessage": message} if message else {}
 
 

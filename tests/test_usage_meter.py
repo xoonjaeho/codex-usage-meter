@@ -26,7 +26,30 @@ CAPTURED = (
 )
 CAPTURED_LINE = "ctx 19.5% (92,684 / 475,000) | 5h 12% (reset: 2h 10m) wk 74% (reset: 1d 17h)"
 CAPTURED_NORM = "ctx 19.5% (92,684 / 475,000) | 5h 12% (reset: X) wk 74% (reset: X)"
-WK_MESSAGE = "⚠ Codex wk 74% — prefer engines on another pool"
+WK_MESSAGE = "quota warn wk 74"
+
+
+LEGACY_CONFIG = {
+    "context_warnings": [
+        {"at": 25, "message": "ctx low {pct}"},
+        {"at": 50, "message": "ctx mid {pct}"},
+        {"at": 75, "message": "ctx high {pct}"},
+    ],
+    "quota_warnings": [
+        {"at": 70, "message": "quota warn {window} {pct}"},
+        {"at": 90, "message": "quota high {window} {pct}"},
+    ],
+}
+
+
+def write_config(tmp_path: Path, config: object) -> None:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (home / "codex-usage-meter.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def legacy_config(tmp_path: Path) -> None:
+    write_config(tmp_path, LEGACY_CONFIG)
 
 
 def norm(line: str) -> str:
@@ -169,6 +192,7 @@ def test_scan_picks_newest_event_when_line_spans_chunks(tmp_path):
 
 
 def test_band_fires_once_then_again_after_drop_and_recross(tmp_path):
+    legacy_config(tmp_path)
     def prompt(tokens: int) -> dict:
         rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=tokens, secondary=10.0)])
         return run_stop(tmp_path, rollout)
@@ -179,26 +203,28 @@ def test_band_fires_once_then_again_after_drop_and_recross(tmp_path):
     dropped = prompt(10000)
     recross = prompt(130000)
 
-    assert first["systemMessage"] == "⚠ ctx 27.4% crossed — protect: delegate reads, tighten output caps"
+    assert first["systemMessage"] == "ctx low 27.4"
     assert again == {}
-    assert higher["systemMessage"] == "⚠ ctx 52.6% crossed — /compact after the current task"
+    assert higher["systemMessage"] == "ctx mid 52.6"
     assert dropped == {}
     assert recross["systemMessage"] == first["systemMessage"]
 
 
 def test_ctx_and_quota_messages_are_joined_by_newline(tmp_path):
+    legacy_config(tmp_path)
     rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=400000, primary=95.0, secondary=70.0)])
 
     out = run_stop(tmp_path, rollout)
 
     assert out["systemMessage"] == (
-        "⚠ ctx 84.2% crossed — stop at a clean point, then /compact or /new\n"
-        "⚠ Codex 5h 95% — orchestrator only, delegate execution\n"
-        "⚠ Codex wk 70% — prefer engines on another pool"
+        "ctx high 84.2\n"
+        "quota high 5h 95\n"
+        "quota warn wk 70"
     )
 
 
 def test_unknown_info_leaves_context_band_untouched(tmp_path):
+    legacy_config(tmp_path)
     high = write_rollout(tmp_path / "r.jsonl", [event(tokens=400000, secondary=10.0)])
     run_stop(tmp_path, high)
     unknown = write_rollout(tmp_path / "r.jsonl", [event(info=False, secondary=10.0)])
@@ -229,6 +255,7 @@ def test_stop_without_session_id_prints_nothing_and_writes_no_state(tmp_path):
 
 
 def test_state_file_records_bands_per_session(tmp_path):
+    legacy_config(tmp_path)
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
     run_stop(tmp_path, rollout, session="abc")
@@ -238,6 +265,7 @@ def test_state_file_records_bands_per_session(tmp_path):
 
 
 def test_corrupt_state_is_treated_as_fresh(tmp_path):
+    legacy_config(tmp_path)
     state_dir = tmp_path / "home" / "codex-usage-meter" / "state"
     state_dir.mkdir(parents=True)
     (state_dir / "s1.json").write_text("{not json", encoding="utf-8")
@@ -285,7 +313,7 @@ def test_quota_label_for_unknown_window_uses_minutes():
     line, _, quota = module.build_line(None, limits, NOW)
 
     assert line.startswith("ctx unknown | 60m 12% (reset: 2h 10m) wk 74%")
-    assert quota == {"60m": 12.0, "wk": 74.0}
+    assert quota == {"60m": (12.0, "2h 10m"), "wk": (74.0, "1d 17h")}
 
 
 def test_context_percent_is_capped_at_window(tmp_path):
@@ -297,6 +325,7 @@ def test_context_percent_is_capped_at_window(tmp_path):
 
 
 def test_quota_band_does_not_fire_on_drop_and_fires_again_on_recross(tmp_path):
+    legacy_config(tmp_path)
     def prompt(secondary: float) -> dict:
         rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=1000, secondary=secondary)])
         return run_stop(tmp_path, rollout)
@@ -306,7 +335,7 @@ def test_quota_band_does_not_fire_on_drop_and_fires_again_on_recross(tmp_path):
     assert first["systemMessage"] == WK_MESSAGE
     assert same == {}
     assert dropped == {}
-    assert recross["systemMessage"] == "⚠ Codex wk 92% — orchestrator only, delegate execution"
+    assert recross["systemMessage"] == "quota high wk 92"
 
 
 def run_raw(tmp_path: Path, stdin: bytes) -> subprocess.CompletedProcess:
@@ -400,6 +429,7 @@ def test_malformed_quota_window_is_omitted_but_rest_is_shown(tmp_path):
 
 
 def test_type_corrupted_state_self_heals(tmp_path):
+    legacy_config(tmp_path)
     state_dir = tmp_path / "home" / "codex-usage-meter" / "state"
     state_dir.mkdir(parents=True)
     (state_dir / "s1.json").write_text('{"ctx": null, "quota": {"wk": "70"}}', encoding="utf-8")
@@ -412,6 +442,7 @@ def test_type_corrupted_state_self_heals(tmp_path):
 
 
 def test_save_failure_keeps_message_and_leaves_no_temp_file(tmp_path):
+    legacy_config(tmp_path)
     state_dir = tmp_path / "home" / "codex-usage-meter" / "state"
     (state_dir / "s1.json").mkdir(parents=True)
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
@@ -505,6 +536,7 @@ def stop_payload(rollout: Path) -> dict:
 
 
 def test_stop_live_shaped_input_emits_only_system_message_once(tmp_path):
+    legacy_config(tmp_path)
     rollout = write_rollout(tmp_path / "r.jsonl", [ASSISTANT_LINE, CAPTURED])
     payload = stop_payload(rollout)
 
@@ -563,26 +595,29 @@ def stored_state(tmp_path: Path, session: str = "s1") -> dict:
 
 
 def test_prompt_after_compaction_rearms_ctx_warning_for_next_stop(tmp_path):
+    legacy_config(tmp_path)
     first = run_stop(tmp_path, ctx_rollout(tmp_path, 380000))  # 80.0%, band 75
     prompt, _ = run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 261250))})  # 55.0%, band 50
     lowered = stored_state(tmp_path)["ctx"]
     second = run_stop(tmp_path, ctx_rollout(tmp_path, 361000))  # 76.0%, band 75 again
 
-    assert first == {"systemMessage": "⚠ ctx 80.0% crossed — stop at a clean point, then /compact or /new"}
+    assert first == {"systemMessage": "ctx high 80.0"}
     assert set(prompt) == {"hookSpecificOutput"}
     assert lowered == 50
-    assert second == {"systemMessage": "⚠ ctx 76.0% crossed — stop at a clean point, then /compact or /new"}
+    assert second == {"systemMessage": "ctx high 76.0"}
 
 
 def test_prompt_after_quota_drop_rearms_quota_warning_for_next_stop(tmp_path):
+    legacy_config(tmp_path)
     first = run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=92.0))
     run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 1000, secondary=10.0))})
     second = run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=92.0))
 
-    assert first == second == {"systemMessage": "⚠ Codex wk 92% — orchestrator only, delegate execution"}
+    assert first == second == {"systemMessage": "quota high wk 92"}
 
 
 def test_prompt_lowers_quota_to_the_current_band_not_below(tmp_path):
+    legacy_config(tmp_path)
     run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=92.0))
     run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 1000, secondary=75.0))})
     lowered = stored_state(tmp_path)["quota"]["wk"]
@@ -593,18 +628,20 @@ def test_prompt_lowers_quota_to_the_current_band_not_below(tmp_path):
 
 
 def test_prompt_seeing_a_higher_band_leaves_stored_band_and_next_stop_still_fires(tmp_path):
+    legacy_config(tmp_path)
     first = run_stop(tmp_path, ctx_rollout(tmp_path, 150000))  # 31.6%, band 25
     prompt, _ = run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 285000))})  # 60.0%, band 50
     stored = stored_state(tmp_path)["ctx"]
     second = run_stop(tmp_path, ctx_rollout(tmp_path, 285000))
 
-    assert first == {"systemMessage": "⚠ ctx 31.6% crossed — protect: delegate reads, tighten output caps"}
+    assert first == {"systemMessage": "ctx low 31.6"}
     assert set(prompt) == {"hookSpecificOutput"}
     assert stored == 25
-    assert second == {"systemMessage": "⚠ ctx 60.0% crossed — /compact after the current task"}
+    assert second == {"systemMessage": "ctx mid 60.0"}
 
 
 def test_prompt_with_agent_id_does_not_lower_bands(tmp_path):
+    legacy_config(tmp_path)
     run_stop(tmp_path, ctx_rollout(tmp_path, 380000))
     run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 1000)), "agent_id": "a1"})
 
@@ -637,3 +674,441 @@ def test_stop_with_empty_session_id_prints_empty_object_and_writes_no_state(tmp_
 
     assert out == {}
     assert not (tmp_path / "home").exists()
+
+
+def stop_in_process(tmp_path: Path, monkeypatch, rollout: Path, now: float = NOW) -> dict:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
+    data = {"hook_event_name": "Stop", "session_id": "s1", "transcript_path": str(rollout)}
+    return load_module().run(data, now)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [
+        (237500, "⚠ Context 50.0% — consider /compact after this task"),
+        (380000, "⚠ Context 80.0% — /compact or start a new session soon"),
+        (437000, "⚠ Context 92.0% — near the limit, /compact now"),
+    ],
+)
+def test_default_context_bands_and_messages(tmp_path, tokens, expected):
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, tokens))
+
+    assert out == {"systemMessage": expected}
+
+
+@pytest.mark.parametrize(
+    ("used", "expected"),
+    [
+        (82.0, "⚠ Codex wk usage 82% — pace your usage (reset: X)"),
+        (96.0, "⚠ Codex wk usage 96% — nearly used up (reset: X)"),
+    ],
+)
+def test_default_quota_bands_and_messages(tmp_path, used, expected):
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=used))
+
+    assert norm(out["systemMessage"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("now", "drop_resets_at", "expected"),
+    [(1794624083 + 10, False, "passed"), (NOW, True, "unknown"), (NOW, False, "1d 17h")],
+    ids=["passed", "unknown", "days-hours"],
+)
+def test_quota_reset_placeholder_forms(tmp_path, monkeypatch, now, drop_resets_at, expected):
+    data = json.loads(event(secondary=82.0))
+    if drop_resets_at:
+        del data["payload"]["rate_limits"]["secondary"]["resets_at"]
+    rollout = write_rollout(tmp_path / "r.jsonl", [json.dumps(data)])
+
+    out = stop_in_process(tmp_path, monkeypatch, rollout, now)
+
+    assert out == {"systemMessage": f"⚠ Codex wk usage 82% — pace your usage (reset: {expected})"}
+
+
+def test_custom_warnings_and_placeholders_from_file(tmp_path, monkeypatch):
+    write_config(tmp_path, {
+        "context_warnings": [
+            {"at": 10, "message": "C {pct} b{band} {window} {foo}"},
+            {"at": 20, "message": "D"},
+        ],
+        "quota_warnings": [{"at": 50.5, "message": "Q {window} {pct} {band} {reset} {unknown}"}],
+    })
+    rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
+
+    out = stop_in_process(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": "C 19.5 b10 {window} {foo}\nQ wk 74 50.5 1d 17h {unknown}"}
+
+
+@pytest.mark.parametrize(
+    ("at", "expected"),
+    [(10.0, "b10"), (12.5, "b12.5"), (33.333333333333336, "b33.33333333")],
+    ids=["integral-float", "fraction", "ten-significant-digits"],
+)
+def test_band_placeholder_formatting(tmp_path, monkeypatch, at, expected):
+    write_config(tmp_path, {"context_warnings": [{"at": at, "message": "b{band}"}]})
+
+    out = stop_in_process(tmp_path, monkeypatch, ctx_rollout(tmp_path, 190000))
+
+    assert out == {"systemMessage": expected}
+
+
+def notices_and_rest(message: str) -> tuple[list[str], list[str]]:
+    lines = message.split("\n")
+    notices = [line for line in lines if line.startswith("codex-usage-meter.json: ")]
+    return notices, [line for line in lines if line not in notices]
+
+
+def assert_single_notice(message: str, key: str) -> list[str]:
+    notices, rest = notices_and_rest(message)
+    assert len(notices) == 1
+    assert notices[0].startswith(f"codex-usage-meter.json: {key} ignored (")
+    assert notices[0].endswith(") — using defaults")
+    return rest
+
+
+GOOD_WARNING = [{"at": 10, "message": "a"}]
+BAD_WARNINGS = {
+    "non-list": 50,
+    "empty-list": [],
+    "entry-not-object": [5],
+    "at-missing": [{"message": "a"}],
+    "at-string": [{"at": "50", "message": "a"}],
+    "at-zero": [{"at": 0, "message": "a"}],
+    "at-below-one": [{"at": 0.5, "message": "a"}],
+    "at-above-100": [{"at": 101, "message": "a"}],
+    "at-bool": [{"at": True, "message": "a"}],
+    "at-nan": [{"at": float("nan"), "message": "a"}],
+    "at-huge-int": [{"at": 10**400, "message": "a"}],
+    "message-empty": [{"at": 10, "message": " "}],
+    "message-not-string": [{"at": 10, "message": 5}],
+    "message-missing": [{"at": 10}],
+    "not-ascending": [{"at": 75, "message": "a"}, {"at": 50, "message": "b"}],
+    "equal-values": [{"at": 50, "message": "a"}, {"at": 50, "message": "b"}],
+}
+
+
+@pytest.mark.parametrize("bad", BAD_WARNINGS.values(), ids=BAD_WARNINGS.keys())
+def test_bad_context_warnings_fall_back_but_quota_warnings_still_apply(tmp_path, bad):
+    write_config(tmp_path, {"context_warnings": bad, "quota_warnings": [{"at": 50, "message": "Q {pct}"}]})
+    rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=285000, secondary=74.0)])
+
+    out = run_stop(tmp_path, rollout)
+
+    rest = assert_single_notice(out["systemMessage"], "context_warnings")
+    assert rest == ["⚠ Context 60.0% — consider /compact after this task", "Q 74"]
+
+
+@pytest.mark.parametrize("bad", BAD_WARNINGS.values(), ids=BAD_WARNINGS.keys())
+def test_bad_quota_warnings_fall_back_but_context_warnings_still_apply(tmp_path, bad):
+    write_config(tmp_path, {"quota_warnings": bad, "context_warnings": [{"at": 10, "message": "C {pct}"}]})
+    rollout = write_rollout(tmp_path / "r.jsonl", [event(secondary=82.0)])
+
+    out = run_stop(tmp_path, rollout)
+
+    rest = assert_single_notice(out["systemMessage"], "quota_warnings")
+    assert [norm(line) for line in rest] == ["C 19.5", "⚠ Codex wk usage 82% — pace your usage (reset: X)"]
+
+
+def test_huge_integer_in_config_keeps_the_usage_line_on_both_events(tmp_path):
+    write_config(tmp_path, {"context_warnings": BAD_WARNINGS["at-huge-int"], "quota_warnings": GOOD_WARNING})
+    rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
+
+    prompt, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
+    stop = run_stop(tmp_path, rollout)
+
+    assert norm(context_of(prompt)) == CAPTURED_NORM
+    assert set(stop) == {"systemMessage"}
+
+
+def test_old_style_and_one_sided_keys_are_ignored_without_notice(tmp_path):
+    write_config(tmp_path, {"context_bands": [10], "context_messages": ["x"], "quota_bands": [1]})
+
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, 237500))
+
+    assert out == {"systemMessage": "⚠ Context 50.0% — consider /compact after this task"}
+
+
+def test_config_with_utf8_bom_is_honoured(tmp_path):
+    (tmp_path / "home").mkdir()
+    body = json.dumps({"context_warnings": [{"at": 10, "message": "bom {pct}"}]}).encode()
+    (tmp_path / "home" / "codex-usage-meter.json").write_bytes(b"\xef\xbb\xbf" + body)
+
+    out = run_stop(tmp_path, write_rollout(tmp_path / "r.jsonl", [CAPTURED]))
+
+    assert out == {"systemMessage": "bom 19.5"}
+
+
+def padded_config(size: int) -> bytes:
+    head, tail = '{"warnings": false, "pad": "', '"}'
+    return (head + "a" * (size - len(head) - len(tail)) + tail).encode()
+
+
+def test_config_of_exactly_64_kib_is_read(tmp_path):
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "codex-usage-meter.json").write_bytes(padded_config(64 << 10))
+
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, 437000))
+
+    assert out == {}
+
+
+def test_oversized_config_means_defaults_and_is_announced_once(tmp_path):
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "codex-usage-meter.json").write_bytes(padded_config((64 << 10) + 1))
+    rollout = ctx_rollout(tmp_path, 437000)
+
+    first = run_stop(tmp_path, rollout)
+    second = run_stop(tmp_path, rollout)
+
+    assert first == {"systemMessage": (
+        "codex-usage-meter.json: config file ignored (larger than 64 KiB) — using defaults\n"
+        "⚠ Context 92.0% — near the limit, /compact now"
+    )}
+    assert second == {}
+
+
+def test_deeply_nested_config_means_defaults_with_notice(tmp_path):
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "codex-usage-meter.json").write_text("[" * 50000, encoding="utf-8")
+
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, 237500))
+
+    assert out == {"systemMessage": (
+        "codex-usage-meter.json: config file ignored (not valid JSON) — using defaults\n"
+        "⚠ Context 50.0% — consider /compact after this task"
+    )}
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [("[1, 2]", "not a JSON object"), ('"text"', "not a JSON object"), ("null", "not a JSON object"),
+     ("{not json", "not valid JSON"), ("", "not valid JSON")],
+    ids=["array", "string", "null", "garbage", "empty"],
+)
+def test_non_object_or_unparseable_config_means_defaults_with_notice(tmp_path, raw, reason):
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "codex-usage-meter.json").write_text(raw, encoding="utf-8")
+
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, 237500))
+
+    assert out == {"systemMessage": (
+        f"codex-usage-meter.json: config file ignored ({reason}) — using defaults\n"
+        "⚠ Context 50.0% — consider /compact after this task"
+    )}
+
+
+def test_unreadable_config_means_defaults_without_notice(tmp_path):
+    (tmp_path / "home" / "codex-usage-meter.json").mkdir(parents=True)
+
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, 237500))
+
+    assert out == {"systemMessage": "⚠ Context 50.0% — consider /compact after this task"}
+
+
+def test_config_notice_is_shown_once_and_again_when_the_problem_set_changes(tmp_path):
+    rollout = ctx_rollout(tmp_path, 1000)
+    bad = BAD_WARNINGS["non-list"]
+
+    write_config(tmp_path, {"context_warnings": bad})
+    first, second = run_stop(tmp_path, rollout), run_stop(tmp_path, rollout)
+    write_config(tmp_path, {"context_warnings": bad, "quota_warnings": bad})
+    widened = run_stop(tmp_path, rollout)
+    write_config(tmp_path, {})
+    cleared = run_stop(tmp_path, rollout)
+    write_config(tmp_path, {"context_warnings": bad})
+    again = run_stop(tmp_path, rollout)
+    prompt, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
+
+    assert set(first) == {"systemMessage"}
+    assert first["systemMessage"].startswith("codex-usage-meter.json: context_warnings ignored (")
+    assert second == {}
+    notices, rest = notices_and_rest(widened["systemMessage"])
+    assert [n.split(" ignored")[0] for n in notices] == [
+        "codex-usage-meter.json: context_warnings", "codex-usage-meter.json: quota_warnings",
+    ]
+    assert rest == []
+    assert cleared == {}
+    assert again == first
+    assert set(prompt) == {"hookSpecificOutput"}
+
+
+def test_warnings_false_still_announces_config_problems(tmp_path):
+    write_config(tmp_path, {"warnings": False, "context_warnings": BAD_WARNINGS["non-list"]})
+    rollout = ctx_rollout(tmp_path, 437000, secondary=96.0)
+
+    out = run_stop(tmp_path, rollout)
+
+    assert set(out) == {"systemMessage"}
+    assert assert_single_notice(out["systemMessage"], "context_warnings") == []
+
+
+def test_warnings_false_silences_stop_and_leaves_state_alone_but_line_is_still_injected(tmp_path):
+    write_config(tmp_path, {"warnings": False})
+    state_dir = tmp_path / "home" / "codex-usage-meter" / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "s1.json").write_text('{"ctx": 50, "quota": {}}', encoding="utf-8")
+    rollout = ctx_rollout(tmp_path, 437000, secondary=96.0)
+
+    stop = run_stop(tmp_path, rollout)
+    prompt, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
+
+    assert stop == {}
+    assert json.loads((state_dir / "s1.json").read_text(encoding="utf-8")) == {"ctx": 50, "quota": {}}
+    assert norm(context_of(prompt)).startswith("ctx 92.0% (437,000 / 475,000) | 5h 10% (reset: X) wk 96%")
+
+
+def test_warnings_with_invalid_value_defaults_to_enabled_with_notice(tmp_path):
+    write_config(tmp_path, {"warnings": 0})
+
+    out = run_stop(tmp_path, ctx_rollout(tmp_path, 237500))
+
+    assert assert_single_notice(out["systemMessage"], "warnings") == [
+        "⚠ Context 50.0% — consider /compact after this task",
+    ]
+
+
+def write_state(tmp_path: Path, text: str) -> None:
+    state_dir = tmp_path / "home" / "codex-usage-meter" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "s1.json").write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ('{"ctx": 60, "quota": {"wk": 85}}', {}),
+        ('{"ctx": 40, "quota": {"wk": 70}}', {"systemMessage": (
+            "⚠ Context 55.0% — consider /compact after this task\n"
+            "⚠ Codex wk usage 82% — pace your usage (reset: X)"
+        )}),
+    ],
+    ids=["mapped-down-to-configured", "below-every-band-is-zero"],
+)
+def test_stored_band_maps_to_highest_configured_band_not_above_it(tmp_path, stored, expected):
+    write_state(tmp_path, stored)
+    rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=261250, secondary=82.0)])
+
+    out = run_stop(tmp_path, rollout)
+
+    if out:
+        out = {"systemMessage": norm(out["systemMessage"])}
+    assert out == expected
+
+
+def test_prompt_lowering_uses_the_mapped_stored_band(tmp_path):
+    write_state(tmp_path, '{"ctx": 60, "quota": {}}')
+    state_file = tmp_path / "home" / "codex-usage-meter" / "state" / "s1.json"
+
+    run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 261250))})
+    unchanged = json.loads(state_file.read_text(encoding="utf-8"))["ctx"]
+    run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 95000))})
+    lowered = json.loads(state_file.read_text(encoding="utf-8"))["ctx"]
+
+    assert unchanged == 60
+    assert lowered == 0
+
+
+def test_huge_integer_in_state_does_not_silence_stop(tmp_path):
+    write_state(tmp_path, '{"ctx": ' + "9" * 400 + ', "quota": {"wk": ' + "9" * 400 + "}}")
+    rollout = write_rollout(tmp_path / "r.jsonl", [event(secondary=82.0)])
+
+    out = run_stop(tmp_path, rollout)
+
+    assert norm(out["systemMessage"]) == "⚠ Codex wk usage 82% — pace your usage (reset: X)"
+
+
+@pytest.mark.parametrize(
+    ("config", "state", "rollout_event", "expected"),
+    [
+        ({"context_warnings": [{"at": 1, "message": "a"}, {"at": 50, "message": "b"}]},
+         '{"ctx": true, "quota": {}}', event(tokens=4750), "a"),
+        ({"quota_warnings": [{"at": 1, "message": "q"}]},
+         '{"ctx": 0, "quota": {"wk": true}}', event(tokens=1000, primary=None, secondary=5.0), "q"),
+    ],
+    ids=["ctx-bool", "quota-bool"],
+)
+def test_stored_boolean_band_reads_as_zero(tmp_path, config, state, rollout_event, expected):
+    write_config(tmp_path, config)
+    write_state(tmp_path, state)
+
+    out = run_stop(tmp_path, write_rollout(tmp_path / "r.jsonl", [rollout_event]))
+
+    assert out == {"systemMessage": expected}
+
+
+def test_unresolvable_home_keeps_the_usage_line_and_stop_prints_empty_object(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
+    drop = {"CODEX_HOME", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"}
+    env = {k: v for k, v in os.environ.items() if k.upper() not in drop}
+
+    def run_event(name: str) -> dict:
+        payload = {"hook_event_name": name, "session_id": "s1", "transcript_path": str(rollout)}
+        proc = subprocess.run(
+            [sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+    assert norm(context_of(run_event("UserPromptSubmit"))) == CAPTURED_NORM
+    assert run_event("Stop") == {}
+
+
+def test_load_config_never_raises_when_home_cannot_be_resolved(monkeypatch):
+    for name in ("CODEX_HOME", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
+        monkeypatch.delenv(name, raising=False)
+
+    config = load_module().load_config()
+
+    assert config["warnings"] is True
+    assert config["problems"] == []
+
+
+def test_problem_recurrence_is_announced_again_after_a_clean_stop_with_warnings_false(tmp_path):
+    rollout = ctx_rollout(tmp_path, 1000)
+    bad = {"warnings": False, "context_warnings": BAD_WARNINGS["non-list"]}
+
+    write_config(tmp_path, bad)
+    first = run_stop(tmp_path, rollout)
+    write_config(tmp_path, {"warnings": False})
+    clean = run_stop(tmp_path, rollout)
+    write_config(tmp_path, bad)
+    again = run_stop(tmp_path, rollout)
+
+    assert first["systemMessage"].startswith("codex-usage-meter.json: context_warnings ignored (")
+    assert clean == {}
+    assert again == first
+
+
+def test_problem_recurrence_is_announced_again_after_a_clean_stop_without_figures(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [ASSISTANT_LINE])
+    bad = {"context_warnings": BAD_WARNINGS["non-list"]}
+
+    write_config(tmp_path, bad)
+    first = run_stop(tmp_path, rollout)
+    write_config(tmp_path, {})
+    clean = run_stop(tmp_path, rollout)
+    write_config(tmp_path, bad)
+    again = run_stop(tmp_path, rollout)
+
+    assert first["systemMessage"].startswith("codex-usage-meter.json: context_warnings ignored (")
+    assert clean == {}
+    assert again == first
+
+
+def test_config_notice_survives_an_unreadable_rollout(tmp_path):
+    write_config(tmp_path, {"context_warnings": BAD_WARNINGS["non-list"]})
+
+    out = run_stop(tmp_path, tmp_path / "missing.jsonl")
+
+    assert set(out) == {"systemMessage"}
+    assert assert_single_notice(out["systemMessage"], "context_warnings") == []
+
+
+def test_deeply_nested_state_file_is_treated_as_fresh(tmp_path):
+    write_state(tmp_path, "[" * 50000)
+    rollout = write_rollout(tmp_path / "r.jsonl", [event(secondary=82.0)])
+
+    out = run_stop(tmp_path, rollout)
+
+    assert norm(out["systemMessage"]) == "⚠ Codex wk usage 82% — pace your usage (reset: X)"
