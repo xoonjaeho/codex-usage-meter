@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -1112,3 +1113,286 @@ def test_deeply_nested_state_file_is_treated_as_fresh(tmp_path):
     out = run_stop(tmp_path, rollout)
 
     assert norm(out["systemMessage"]) == "⚠ Codex wk usage 82% — pace your usage (reset: X)"
+
+
+# Captured from a codex-tui 0.159.2 rollout; tests rewrite timestamp, turn_id and the usage figures.
+USAGE_RECORD = (
+    '{"timestamp":"2026-11-12T07:59:17.265Z","ordinal":25,"type":"token_usage_record","payload":{"thread_id":'
+    '"01a1cec3-16a2-73c1-9875-8060de0e73c2","turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0","session_id":'
+    '"01a1cec3-16a2-73c1-9875-8060de0e73c2","root_turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0","response_id":'
+    '"resp_03a8a698f9485a76016af571d2136487d0aa4941b11fa82b35","usage":{"input_tokens":22392,"cached_input_tokens":'
+    '22144,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":0,"total_tokens":22398},'
+    '"turn_token_usage":{"input_tokens":22392,"cached_input_tokens":22144,"cache_write_input_tokens":0,'
+    '"output_tokens":6,"reasoning_output_tokens":0,"total_tokens":22398},"thread_token_usage":{"input_tokens":44715,'
+    '"cached_input_tokens":22144,"cache_write_input_tokens":0,"output_tokens":11,"reasoning_output_tokens":0,'
+    '"total_tokens":44726}}}'
+)
+TASK_STARTED = (
+    '{"timestamp":"2026-11-12T07:59:05.904Z","ordinal":18,"type":"event_msg","payload":{"type":"task_started",'
+    '"turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0","root_turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0",'
+    '"started_at":1794470345,"model_context_window":475000,"collaboration_mode_kind":"default"}}'
+)
+CACHE_CONFIG = {"cache_warm_message": "warm {until} {ttl}", "cache_cold_message": "cold {idle} {ttl}"}
+# Local noon, so a 30-minute expiry stays on the same local day in every time zone.
+CACHE_NOW = datetime(2026, 11, 12, 12, 0).timestamp()
+
+
+def iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def clock(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%H:%M")
+
+
+def usage_record(at: float, turn: str, input_tokens: int, cached: int) -> str:
+    data = json.loads(USAGE_RECORD)
+    data["timestamp"] = iso(at)
+    data["payload"]["turn_id"] = turn
+    data["payload"]["usage"].update(input_tokens=input_tokens, cached_input_tokens=cached)
+    return json.dumps(data)
+
+
+def task_started(at: float, turn: str) -> str:
+    data = json.loads(TASK_STARTED)
+    data["timestamp"] = iso(at)
+    data["payload"]["turn_id"] = turn
+    return json.dumps(data)
+
+
+def compacted(at: float) -> str:
+    # Real payloads also carry replacement_history and ~100 KB of other fields; only the record type matters here.
+    return json.dumps({"timestamp": iso(at), "type": "compacted", "payload": {"message": "", "replacement_history": []}})
+
+
+def two_turns(
+    tmp_path: Path, idle: float, cached: int, between: tuple = (), extra: tuple = (),
+    previous_input: int = 22323, own_input: int = 22392,
+) -> Path:
+    """Turn a: one request at CACHE_NOW-idle-60. Turn b starts `idle` seconds later; its first request reuses `cached`."""
+    a_done = CACHE_NOW - idle - 60
+    lines = [
+        task_started(a_done - 10, "a"), usage_record(a_done, "a", previous_input, 0), *between,
+        task_started(a_done + idle, "b"), usage_record(a_done + idle + 5, "b", own_input, cached), *extra,
+    ]
+    return write_rollout(tmp_path / "r.jsonl", lines)
+
+
+def stop_at(tmp_path: Path, monkeypatch, rollout: Path, now: float = CACHE_NOW) -> dict:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
+    return load_module().run({"session_id": "s1", "hook_event_name": "Stop", "transcript_path": str(rollout)}, now)
+
+
+def test_warm_line_counts_ttl_from_the_newest_request(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=120, cached=22144)
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 1800)} 30"}
+
+
+def test_turn_that_reused_under_half_the_previous_input_gets_a_cold_line_before_the_warm_line(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=42 * 60, cached=8320)
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out["systemMessage"].split("\n") == ["cold 42m 30", f"warm {clock(CACHE_NOW - 55 + 1800)} 30"]
+
+
+def test_default_cache_lines_follow_band_warnings(tmp_path, monkeypatch):
+    legacy_config(tmp_path)
+    rollout = two_turns(tmp_path, idle=42 * 60, cached=8320, extra=(CAPTURED,))
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out["systemMessage"].split("\n") == [
+        WK_MESSAGE,
+        "🌊 This turn started on a cold prompt cache (idle 42m)",
+        f"🧊 Prompt cache warm until {clock(CACHE_NOW - 55 + 1800)} (30m TTL)",
+    ]
+
+
+def test_low_reuse_after_a_compaction_is_not_reported_cold(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=600, cached=8320, between=(compacted(CACHE_NOW - 600),))
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 1800)} 30"}
+
+
+def test_only_the_turns_first_request_decides_cold(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=60, cached=22144, extra=(usage_record(CACHE_NOW - 30, "b", 90000, 4000),))
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 30 + 1800)} 30"}
+
+
+def test_first_turn_of_a_session_is_never_reported_cold(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = write_rollout(tmp_path / "r.jsonl", [task_started(CACHE_NOW - 20, "a"), usage_record(CACHE_NOW - 10, "a", 22323, 0)])
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 10 + 1800)} 30"}
+
+
+def test_expired_cache_gets_no_warm_line(tmp_path, monkeypatch):
+    write_config(tmp_path, {**CACHE_CONFIG, "cache_ttl_minutes": 0.5})
+    rollout = two_turns(tmp_path, idle=120, cached=22144)
+
+    assert stop_at(tmp_path, monkeypatch, rollout) == {}
+
+
+def test_configured_ttl_moves_the_expiry(tmp_path, monkeypatch):
+    write_config(tmp_path, {**CACHE_CONFIG, "cache_ttl_minutes": 60})
+    rollout = two_turns(tmp_path, idle=120, cached=22144)
+
+    out = stop_at(tmp_path, monkeypatch, rollout, now=CACHE_NOW + 1800)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 3600)} 60"}
+
+
+def test_expiry_on_another_day_carries_the_date(tmp_path, monkeypatch):
+    write_config(tmp_path, {**CACHE_CONFIG, "cache_ttl_minutes": 1440})
+    rollout = two_turns(tmp_path, idle=120, cached=22144)
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {datetime.fromtimestamp(CACHE_NOW - 55 + 86400).strftime('%m-%d %H:%M')} 1440"}
+
+
+def test_cache_notices_false_keeps_band_warnings_only(tmp_path, monkeypatch):
+    write_config(tmp_path, {**LEGACY_CONFIG, "cache_notices": False})
+    rollout = two_turns(tmp_path, idle=42 * 60, cached=8320, extra=(CAPTURED,))
+
+    assert stop_at(tmp_path, monkeypatch, rollout) == {"systemMessage": WK_MESSAGE}
+
+
+@pytest.mark.parametrize("key, value", [
+    ("cache_ttl_minutes", 0),
+    ("cache_ttl_minutes", -5),
+    ("cache_ttl_minutes", True),
+    ("cache_ttl_minutes", "30"),
+    ("cache_ttl_minutes", 1441),
+    ("cache_ttl_minutes", 10 ** 400),
+    ("cache_notices", "yes"),
+    ("cache_warm_message", "   "),
+    ("cache_cold_message", 5),
+])
+def test_invalid_cache_setting_falls_back_to_default_with_notice(tmp_path, monkeypatch, key, value):
+    write_config(tmp_path, {key: value})
+    rollout = two_turns(tmp_path, idle=42 * 60, cached=8320)
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert assert_single_notice(out["systemMessage"], key) == [
+        "🌊 This turn started on a cold prompt cache (idle 42m)",
+        f"🧊 Prompt cache warm until {clock(CACHE_NOW - 55 + 1800)} (30m TTL)",
+    ]
+
+
+def test_malformed_usage_records_are_skipped(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    broken = json.loads(usage_record(CACHE_NOW - 5, "b", 1, 0))
+    broken["payload"]["usage"] = None
+    rollout = two_turns(tmp_path, idle=120, cached=22144, extra=(json.dumps(broken), '{"token_usage_record": [[['))
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 1800)} 30"}
+
+
+def test_newer_turn_without_a_request_does_not_repeat_the_previous_cold_line(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=42 * 60, cached=8320, extra=(task_started(CACHE_NOW - 20, "c"),))
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 1800)} 30"}
+
+
+def test_refired_stop_in_the_same_turn_drops_the_cold_line(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
+    rollout = two_turns(tmp_path, idle=42 * 60, cached=8320)
+    data = {"session_id": "s1", "hook_event_name": "Stop", "transcript_path": str(rollout), "stop_hook_active": True}
+
+    out = load_module().run(data, CACHE_NOW)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 1800)} 30"}
+
+
+def test_idle_runs_to_the_turn_start_not_to_its_first_response(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = write_rollout(tmp_path / "r.jsonl", [
+        usage_record(CACHE_NOW - 3600, "a", 22323, 0),
+        task_started(CACHE_NOW - 1200, "b"), usage_record(CACHE_NOW - 600, "b", 22392, 8320),
+    ])
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out["systemMessage"].split("\n")[0] == "cold 40m 30"
+
+
+def test_compaction_after_the_turns_first_request_keeps_the_cold_line(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(
+        tmp_path, idle=42 * 60, cached=8320, extra=(compacted(CACHE_NOW - 50), usage_record(CACHE_NOW - 40, "b", 9000, 8320)),
+    )
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"cold 42m 30\nwarm {clock(CACHE_NOW - 40 + 1800)} 30"}
+
+
+def test_compaction_after_the_newest_request_drops_the_warm_line(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=120, cached=22144, extra=(compacted(CACHE_NOW - 50),))
+
+    assert stop_at(tmp_path, monkeypatch, rollout) == {}
+
+
+def test_prompt_shorter_than_the_previous_one_is_not_cold_when_fully_reused(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=120, cached=19840, previous_input=100000, own_input=20000)
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 1800)} 30"}
+
+
+@pytest.mark.parametrize("usage", [{}, {"input_tokens": 5, "cached_input_tokens": -1}, {"input_tokens": True,
+                                                                                        "cached_input_tokens": 0}])
+def test_usage_record_without_valid_token_counts_is_skipped(tmp_path, monkeypatch, usage):
+    write_config(tmp_path, CACHE_CONFIG)
+    broken = json.loads(usage_record(CACHE_NOW + 590, "b", 1, 0))
+    broken["payload"]["usage"] = usage
+    rollout = two_turns(tmp_path, idle=120, cached=22144, extra=(json.dumps(broken),))
+
+    out = stop_at(tmp_path, monkeypatch, rollout, now=CACHE_NOW + 600)
+
+    assert out == {"systemMessage": f"warm {clock(CACHE_NOW - 55 + 1800)} 30"}
+
+
+def test_cold_after_under_half_a_minute_reads_less_than_one_minute(tmp_path, monkeypatch):
+    write_config(tmp_path, CACHE_CONFIG)
+    rollout = two_turns(tmp_path, idle=10, cached=8320)
+
+    out = stop_at(tmp_path, monkeypatch, rollout)
+
+    assert out["systemMessage"].split("\n")[0] == "cold <1m 30"
+
+
+def test_stop_process_on_a_fresh_rollout_shows_the_default_warm_line(tmp_path):
+    now = datetime.now(timezone.utc).timestamp()
+    rollout = write_rollout(tmp_path / "r.jsonl", [task_started(now - 20, "a"), usage_record(now - 10, "a", 22323, 0)])
+
+    out = run_stop(tmp_path, rollout)
+
+    assert set(out) == {"systemMessage"}
+    assert re.fullmatch(r"🧊 Prompt cache warm until \d\d:\d\d \(30m TTL\)", out["systemMessage"])
