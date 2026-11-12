@@ -1,0 +1,6 @@
+# >>> scaffolds >>>
+# Serena MCP writes this on project activation
+.serena/
+# <<< scaffolds <<<
+__pycache__/
+.pytest_cache/
