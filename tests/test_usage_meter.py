@@ -64,8 +64,12 @@ def write_rollout(path: Path, lines: list[str], trailing: str = "") -> Path:
     return path
 
 
-def run_hook(tmp_path: Path, payload: dict, session: str | None = "s1") -> tuple[dict, subprocess.CompletedProcess]:
+def run_hook(
+    tmp_path: Path, payload: dict, session: str | None = "s1", event: str | None = "UserPromptSubmit",
+) -> tuple[dict, subprocess.CompletedProcess]:
     env = {**os.environ, "CODEX_HOME": str(tmp_path / "home")}
+    if event is not None:
+        payload = {"hook_event_name": event, **payload}
     if session is not None:
         payload = {"session_id": session, **payload}
     proc = subprocess.run(
@@ -75,28 +79,35 @@ def run_hook(tmp_path: Path, payload: dict, session: str | None = "s1") -> tuple
     return json.loads(proc.stdout), proc
 
 
+def run_stop(tmp_path: Path, rollout: Path, session: str | None = "s1", **extra) -> dict:
+    payload = {"hook_event_name": "Stop", "transcript_path": str(rollout), **extra}
+    return run_hook(tmp_path, payload, session=session)[0]
+
+
 def context_of(out: dict) -> str:
     assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     return out["hookSpecificOutput"]["additionalContext"]
 
 
-def test_captured_line_produces_exact_line_and_quota_message(tmp_path):
+def test_prompt_gets_line_and_no_message_or_state(tmp_path):
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
     out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
 
     assert norm(context_of(out)) == CAPTURED_NORM
-    assert out["systemMessage"] == WK_MESSAGE
+    assert set(out) == {"hookSpecificOutput"}
+    assert not (tmp_path / "home").exists()
 
 
 def test_captured_line_exact_with_fixed_clock(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    out = load_module().run({"session_id": "s1", "transcript_path": str(rollout)}, NOW)
+    data = {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "transcript_path": str(rollout)}
+    out = load_module().run(data, NOW)
 
-    assert context_of(out) == CAPTURED_LINE
-    assert out["systemMessage"] == WK_MESSAGE
+    assert out == {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": CAPTURED_LINE}}
+    assert not (tmp_path / "home").exists()
 
 
 def test_first_turn_without_token_count_is_unknown(tmp_path):
@@ -111,7 +122,6 @@ def test_transcript_path_null_is_unknown(tmp_path):
     out, _ = run_hook(tmp_path, {"transcript_path": None})
 
     assert context_of(out) == "ctx unknown"
-    assert "systemMessage" not in out
 
 
 def test_newest_event_with_null_info_falls_back_to_older_info(tmp_path):
@@ -161,8 +171,7 @@ def test_scan_picks_newest_event_when_line_spans_chunks(tmp_path):
 def test_band_fires_once_then_again_after_drop_and_recross(tmp_path):
     def prompt(tokens: int) -> dict:
         rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=tokens, secondary=10.0)])
-        out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
-        return out
+        return run_stop(tmp_path, rollout)
 
     first = prompt(130000)  # 27.4%
     again = prompt(140000)  # still band 25
@@ -171,17 +180,16 @@ def test_band_fires_once_then_again_after_drop_and_recross(tmp_path):
     recross = prompt(130000)
 
     assert first["systemMessage"] == "⚠ ctx 27.4% crossed — protect: delegate reads, tighten output caps"
-    assert "systemMessage" not in again
+    assert again == {}
     assert higher["systemMessage"] == "⚠ ctx 52.6% crossed — /compact after the current task"
-    assert "systemMessage" not in dropped
-    assert context_of(dropped).startswith("ctx 2.1% (10,000 / 475,000) | 5h 12%")
+    assert dropped == {}
     assert recross["systemMessage"] == first["systemMessage"]
 
 
 def test_ctx_and_quota_messages_are_joined_by_newline(tmp_path):
     rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=400000, primary=95.0, secondary=70.0)])
 
-    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
+    out = run_stop(tmp_path, rollout)
 
     assert out["systemMessage"] == (
         "⚠ ctx 84.2% crossed — stop at a clean point, then /compact or /new\n"
@@ -192,40 +200,38 @@ def test_ctx_and_quota_messages_are_joined_by_newline(tmp_path):
 
 def test_unknown_info_leaves_context_band_untouched(tmp_path):
     high = write_rollout(tmp_path / "r.jsonl", [event(tokens=400000, secondary=10.0)])
-    run_hook(tmp_path, {"transcript_path": str(high)})
+    run_stop(tmp_path, high)
     unknown = write_rollout(tmp_path / "r.jsonl", [event(info=False, secondary=10.0)])
-    run_hook(tmp_path, {"transcript_path": str(unknown)})
+    run_stop(tmp_path, unknown)
 
     back = write_rollout(tmp_path / "r.jsonl", [event(tokens=400000, secondary=10.0)])
-    out, _ = run_hook(tmp_path, {"transcript_path": str(back)})
+    out = run_stop(tmp_path, back)
 
-    assert "systemMessage" not in out
+    assert out == {}
 
 
-def test_subagent_turn_gets_line_but_no_message_or_state(tmp_path):
+def test_stop_with_agent_id_prints_nothing_and_writes_no_state(tmp_path):
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout), "agent_id": "a1", "agent_type": "worker"})
+    out = run_stop(tmp_path, rollout, agent_id="a1", agent_type="worker")
 
-    assert norm(context_of(out)) == CAPTURED_NORM
-    assert "systemMessage" not in out
+    assert out == {}
     assert not (tmp_path / "home").exists()
 
 
-def test_missing_session_id_gets_line_but_no_message_or_state(tmp_path):
+def test_stop_without_session_id_prints_nothing_and_writes_no_state(tmp_path):
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)}, session=None)
+    out = run_stop(tmp_path, rollout, session=None)
 
-    assert norm(context_of(out)) == CAPTURED_NORM
-    assert "systemMessage" not in out
+    assert out == {}
     assert not (tmp_path / "home").exists()
 
 
 def test_state_file_records_bands_per_session(tmp_path):
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    run_hook(tmp_path, {"transcript_path": str(rollout)}, session="abc")
+    run_stop(tmp_path, rollout, session="abc")
 
     state = json.loads((tmp_path / "home" / "codex-usage-meter" / "state" / "abc.json").read_text(encoding="utf-8"))
     assert state == {"ctx": 0, "quota": {"5h": 0, "wk": 70}}
@@ -237,9 +243,9 @@ def test_corrupt_state_is_treated_as_fresh(tmp_path):
     (state_dir / "s1.json").write_text("{not json", encoding="utf-8")
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
+    out = run_stop(tmp_path, rollout)
 
-    assert out["systemMessage"] == WK_MESSAGE
+    assert out == {"systemMessage": WK_MESSAGE}
 
 
 def test_missing_transcript_file_yields_usage_error(tmp_path):
@@ -293,20 +299,14 @@ def test_context_percent_is_capped_at_window(tmp_path):
 def test_quota_band_does_not_fire_on_drop_and_fires_again_on_recross(tmp_path):
     def prompt(secondary: float) -> dict:
         rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=1000, secondary=secondary)])
-        return run_hook(tmp_path, {"transcript_path": str(rollout)})[0]
+        return run_stop(tmp_path, rollout)
 
     first, same, dropped, recross = prompt(74.0), prompt(75.0), prompt(10.0), prompt(92.0)
 
     assert first["systemMessage"] == WK_MESSAGE
-    assert "systemMessage" not in same
-    assert "systemMessage" not in dropped
-    assert context_of(dropped).startswith("ctx 0.2% (1,000 / 475,000) | 5h 12%")
+    assert same == {}
+    assert dropped == {}
     assert recross["systemMessage"] == "⚠ Codex wk 92% — orchestrator only, delegate execution"
-
-
-USAGE_ERROR_OUTPUT = {
-    "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "ctx unknown (usage error)"},
-}
 
 
 def run_raw(tmp_path: Path, stdin: bytes) -> subprocess.CompletedProcess:
@@ -314,17 +314,26 @@ def run_raw(tmp_path: Path, stdin: bytes) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(HOOK)], input=stdin, capture_output=True, env=env, timeout=60)
 
 
-@pytest.mark.parametrize("stdin", [b"not json", b"[" * 200000, b"\xff\xfe"], ids=["text", "deep-nesting", "bad-utf8"])
-def test_bad_stdin_exits_zero_with_usage_error_json(tmp_path, stdin):
+def prompt_stdin(transcript_path: object) -> bytes:
+    data = {"session_id": "s1", "hook_event_name": "UserPromptSubmit", "transcript_path": transcript_path}
+    return json.dumps(data).encode()
+
+
+@pytest.mark.parametrize(
+    "stdin",
+    [b"not json", b"[" * 200000, b"\xff\xfe", b"[]", b"null"],
+    ids=["text", "deep-nesting", "bad-utf8", "array", "null"],
+)
+def test_unparseable_stdin_exits_zero_with_empty_object(tmp_path, stdin):
     proc = run_raw(tmp_path, stdin)
 
     assert proc.returncode == 0
-    assert json.loads(proc.stdout) == USAGE_ERROR_OUTPUT
+    assert json.loads(proc.stdout) == {}
 
 
 def test_stdin_with_utf8_bom_is_parsed(tmp_path):
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
-    payload = json.dumps({"session_id": "s1", "transcript_path": str(rollout)}).encode()
+    payload = prompt_stdin(str(rollout))
 
     proc = run_raw(tmp_path, b"\xef\xbb\xbf" + payload)
 
@@ -334,7 +343,7 @@ def test_stdin_with_utf8_bom_is_parsed(tmp_path):
 def test_session_id_cannot_escape_state_dir(tmp_path):
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    run_hook(tmp_path, {"transcript_path": str(rollout)}, session="../../x")
+    run_stop(tmp_path, rollout, session="../../x")
 
     state_dir = tmp_path / "home" / "codex-usage-meter" / "state"
     assert len(list(state_dir.glob("*.json"))) == 1
@@ -388,7 +397,6 @@ def test_malformed_quota_window_is_omitted_but_rest_is_shown(tmp_path):
     out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
 
     assert norm(context_of(out)) == "ctx 19.5% (92,684 / 475,000) | wk 74% (reset: X)"
-    assert out["systemMessage"] == WK_MESSAGE
 
 
 def test_type_corrupted_state_self_heals(tmp_path):
@@ -397,21 +405,20 @@ def test_type_corrupted_state_self_heals(tmp_path):
     (state_dir / "s1.json").write_text('{"ctx": null, "quota": {"wk": "70"}}', encoding="utf-8")
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
+    out = run_stop(tmp_path, rollout)
 
-    assert norm(context_of(out)) == CAPTURED_NORM
-    assert out["systemMessage"] == WK_MESSAGE
+    assert out == {"systemMessage": WK_MESSAGE}
     assert json.loads((state_dir / "s1.json").read_text(encoding="utf-8")) == {"ctx": 0, "quota": {"5h": 0, "wk": 70}}
 
 
-def test_save_failure_keeps_line_and_leaves_no_temp_file(tmp_path):
+def test_save_failure_keeps_message_and_leaves_no_temp_file(tmp_path):
     state_dir = tmp_path / "home" / "codex-usage-meter" / "state"
     (state_dir / "s1.json").mkdir(parents=True)
     rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
 
-    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
+    out = run_stop(tmp_path, rollout)
 
-    assert norm(context_of(out)) == CAPTURED_NORM
+    assert out == {"systemMessage": WK_MESSAGE}
     assert list(state_dir.glob("*.tmp")) == []
 
 
@@ -431,7 +438,7 @@ def test_scan_budget_limits_how_far_back_the_scan_reads(tmp_path):
 
 @pytest.mark.parametrize("path", [1, True, 7, ""], ids=["int1", "true", "int7", "empty"])
 def test_non_string_transcript_path_counts_as_no_transcript(tmp_path, path):
-    proc = run_raw(tmp_path, json.dumps({"session_id": "s1", "transcript_path": path}).encode())
+    proc = run_raw(tmp_path, prompt_stdin(path))
 
     assert proc.returncode == 0
     assert context_of(json.loads(proc.stdout)) == "ctx unknown"
@@ -484,3 +491,149 @@ def test_zero_window_minutes_omits_that_window(tmp_path):
     line = quota_variant(tmp_path, "secondary", window_minutes=0)
 
     assert line == "ctx 19.5% (92,684 / 475,000) | 5h 12% (reset: X)"
+
+
+ASSISTANT_LINE = json.dumps({"type": "response_item", "payload": {"type": "message", "role": "assistant"}})
+
+
+def stop_payload(rollout: Path) -> dict:
+    return {
+        "session_id": "s1", "turn_id": "t1", "transcript_path": str(rollout), "cwd": "D:\\work",
+        "hook_event_name": "Stop", "model": "gpt-6.1-sol", "permission_mode": "default",
+        "stop_hook_active": False, "last_assistant_message": "OK",
+    }
+
+
+def test_stop_live_shaped_input_emits_only_system_message_once(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [ASSISTANT_LINE, CAPTURED])
+    payload = stop_payload(rollout)
+
+    first, _ = run_hook(tmp_path, payload, session=None)
+    second, _ = run_hook(tmp_path, payload, session=None)
+
+    assert first == {"systemMessage": WK_MESSAGE}
+    assert second == {}
+
+
+def test_stop_without_crossing_prints_exactly_empty_object(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=1000, primary=10.0, secondary=10.0)])
+
+    out = run_stop(tmp_path, rollout)
+
+    assert out == {}
+
+
+def test_stop_with_missing_or_garbage_rollout_prints_empty_object(tmp_path):
+    garbage = tmp_path / "garbage.jsonl"
+    garbage.write_bytes(b'\xff{"token_count"\n[[[\n')
+
+    missing = run_stop(tmp_path, tmp_path / "nope.jsonl")
+    broken = run_stop(tmp_path, garbage)
+
+    assert missing == {}
+    assert broken == {}
+
+
+def test_prompt_event_never_emits_message_or_state_even_when_bands_are_crossed(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [event(tokens=400000, primary=95.0, secondary=70.0)])
+
+    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)}, event="UserPromptSubmit")
+
+    assert set(out) == {"hookSpecificOutput"}
+    assert context_of(out).startswith("ctx 84.2% (400,000 / 475,000) | 5h 95%")
+    assert not (tmp_path / "home").exists()
+
+
+def test_unknown_event_prints_empty_object_and_writes_no_state(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
+
+    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)}, event="SessionStart")
+
+    assert out == {}
+    assert not (tmp_path / "home").exists()
+
+
+def ctx_rollout(tmp_path: Path, tokens: int, secondary: float = 10.0) -> Path:
+    return write_rollout(tmp_path / "r.jsonl", [event(tokens=tokens, primary=10.0, secondary=secondary)])
+
+
+def stored_state(tmp_path: Path, session: str = "s1") -> dict:
+    path = tmp_path / "home" / "codex-usage-meter" / "state" / (session + ".json")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_prompt_after_compaction_rearms_ctx_warning_for_next_stop(tmp_path):
+    first = run_stop(tmp_path, ctx_rollout(tmp_path, 380000))  # 80.0%, band 75
+    prompt, _ = run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 261250))})  # 55.0%, band 50
+    lowered = stored_state(tmp_path)["ctx"]
+    second = run_stop(tmp_path, ctx_rollout(tmp_path, 361000))  # 76.0%, band 75 again
+
+    assert first == {"systemMessage": "⚠ ctx 80.0% crossed — stop at a clean point, then /compact or /new"}
+    assert set(prompt) == {"hookSpecificOutput"}
+    assert lowered == 50
+    assert second == {"systemMessage": "⚠ ctx 76.0% crossed — stop at a clean point, then /compact or /new"}
+
+
+def test_prompt_after_quota_drop_rearms_quota_warning_for_next_stop(tmp_path):
+    first = run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=92.0))
+    run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 1000, secondary=10.0))})
+    second = run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=92.0))
+
+    assert first == second == {"systemMessage": "⚠ Codex wk 92% — orchestrator only, delegate execution"}
+
+
+def test_prompt_lowers_quota_to_the_current_band_not_below(tmp_path):
+    run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=92.0))
+    run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 1000, secondary=75.0))})
+    lowered = stored_state(tmp_path)["quota"]["wk"]
+    same_band = run_stop(tmp_path, ctx_rollout(tmp_path, 1000, secondary=80.0))
+
+    assert lowered == 70
+    assert same_band == {}
+
+
+def test_prompt_seeing_a_higher_band_leaves_stored_band_and_next_stop_still_fires(tmp_path):
+    first = run_stop(tmp_path, ctx_rollout(tmp_path, 150000))  # 31.6%, band 25
+    prompt, _ = run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 285000))})  # 60.0%, band 50
+    stored = stored_state(tmp_path)["ctx"]
+    second = run_stop(tmp_path, ctx_rollout(tmp_path, 285000))
+
+    assert first == {"systemMessage": "⚠ ctx 31.6% crossed — protect: delegate reads, tighten output caps"}
+    assert set(prompt) == {"hookSpecificOutput"}
+    assert stored == 25
+    assert second == {"systemMessage": "⚠ ctx 60.0% crossed — /compact after the current task"}
+
+
+def test_prompt_with_agent_id_does_not_lower_bands(tmp_path):
+    run_stop(tmp_path, ctx_rollout(tmp_path, 380000))
+    run_hook(tmp_path, {"transcript_path": str(ctx_rollout(tmp_path, 1000)), "agent_id": "a1"})
+
+    assert stored_state(tmp_path)["ctx"] == 75
+    assert run_stop(tmp_path, ctx_rollout(tmp_path, 380000)) == {}
+
+
+def test_event_name_missing_prints_empty_object(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
+
+    out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)}, event=None)
+
+    assert out == {}
+    assert not (tmp_path / "home").exists()
+
+
+def test_stop_without_any_figures_prints_empty_object_and_writes_no_state(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [ASSISTANT_LINE])
+
+    out = run_stop(tmp_path, rollout)
+
+    assert out == {}
+    assert not (tmp_path / "home").exists()
+
+
+def test_stop_with_empty_session_id_prints_empty_object_and_writes_no_state(tmp_path):
+    rollout = write_rollout(tmp_path / "r.jsonl", [CAPTURED])
+
+    out = run_stop(tmp_path, rollout, session="")
+
+    assert out == {}
+    assert not (tmp_path / "home").exists()

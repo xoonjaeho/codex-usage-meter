@@ -1,4 +1,8 @@
-"""Codex UserPromptSubmit hook: injects a context/quota usage line read from the session rollout."""
+"""Codex usage hook, one script for two events.
+
+UserPromptSubmit injects a context/quota usage line and may only lower stored bands. Stop emits the threshold
+warnings. Any other event, or input without an event name, prints {}.
+"""
 from __future__ import annotations
 
 import json
@@ -201,37 +205,70 @@ def crossed_messages(session_id: str, pct: float | None, quota: dict[str, float]
     return "\n".join(messages)
 
 
-def usage_output(line: str, message: str = "") -> dict:
-    output: dict[str, Any] = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": line}}
-    if message:
-        output["systemMessage"] = message
-    return output
+def lower_bands(session_id: str, pct: float | None, quota: dict[str, float]) -> None:
+    """Re-arm warnings after a drop (e.g. a compaction, which may not fire Stop); never raises a stored band."""
+    path = state_path(session_id)
+    state = load_state(path)
+    changed = False
+    if pct is not None and band_of(pct, CTX_BANDS) < state["ctx"]:
+        state["ctx"] = band_of(pct, CTX_BANDS)
+        changed = True
+    for label, used in quota.items():
+        if band_of(used, QUOTA_BANDS) < state["quota"].get(label, 0):
+            state["quota"][label] = band_of(used, QUOTA_BANDS)
+            changed = True
+    if changed:
+        save_state(path, state)
 
 
-def run(data: dict, now: float) -> dict:
+def read_usage(data: dict, now: float) -> tuple[str, float | None, dict[str, float]]:
+    transcript = data.get("transcript_path")
+    transcript = transcript if isinstance(transcript, str) else None
+    info, limits = scan_rollout(transcript) if transcript else (None, None)
+    return build_line(info, limits, now)
+
+
+def prompt_output(data: dict, now: float) -> dict:
     try:
-        transcript = data.get("transcript_path")
-        transcript = transcript if isinstance(transcript, str) else None
-        info, limits = scan_rollout(transcript) if transcript else (None, None)
-        line, pct, quota = build_line(info, limits, now)
+        line, pct, quota = read_usage(data, now)
     except Exception:  # a hook must never block the prompt, whatever the rollout contains
-        return usage_output(ERROR_LINE)
-    message = ""
+        line, pct, quota = ERROR_LINE, None, {}
     session_id = data.get("session_id")
     if session_id and "agent_id" not in data:
         try:
-            message = crossed_messages(str(session_id), pct, quota)
+            lower_bands(str(session_id), pct, quota)
         except Exception:
-            message = ""
-    return usage_output(line, message)
+            pass
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": line}}
+
+
+def stop_output(data: dict, now: float) -> dict:
+    """Stop output may only ever carry systemMessage: any decision field would restart the turn."""
+    session_id = data.get("session_id")
+    if not session_id or "agent_id" in data:
+        return {}
+    _, pct, quota = read_usage(data, now)
+    if pct is None and not quota:
+        return {}
+    message = crossed_messages(str(session_id), pct, quota)
+    return {"systemMessage": message} if message else {}
+
+
+def run(data: dict, now: float) -> dict:
+    event = data.get("hook_event_name")
+    if event == "UserPromptSubmit":
+        return prompt_output(data, now)
+    if event == "Stop":
+        return stop_output(data, now)
+    return {}
 
 
 def main() -> int:
     try:
         data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
-        output = run(data if isinstance(data, dict) else {}, time.time())
+        output = run(data, time.time()) if isinstance(data, dict) else {}
     except Exception:
-        output = usage_output(ERROR_LINE)
+        output = {}
     sys.stdout.write(json.dumps(output))
     return 0
 
