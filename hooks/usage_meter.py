@@ -318,6 +318,28 @@ def context_percent(info: dict) -> tuple[float, int, int]:
     return min(tokens, window) / window * 100, tokens, window
 
 
+# Model-facing advice for the context band the line reads. Cumulative: at 60% the 25% advice still holds.
+# Only the user can run /compact or /new, so the advice ends in telling them.
+ADVICE = [
+    (25, "delegate large reads to subagents and cap tool output instead of reading whole files."),
+    (50, "once, at the end of the current step, tell the user /compact is advisable after this task. Keep working."),
+    (
+        75,
+        "stop at a clean boundary, list in your reply what must survive verbatim (IDs, file:line, decisions and their "
+        "why, the next action), and tell the user once to run /compact, or /new and paste that list.",
+    ),
+]
+ADVICE_HEADER = "Context budget (from the ctx line above; you cannot run /compact or /new yourself):"
+
+
+def advice(pct: float | None) -> str | None:
+    """Return the advice for every band reached, or None below the first band or when the figure is unknown."""
+    if pct is None:
+        return None
+    held = [f"- ≥{at}%: {text}" for at, text in ADVICE if pct >= at]
+    return "\n".join([ADVICE_HEADER, *held]) if held else None
+
+
 Quota = dict[str, tuple[float, str]]
 
 
@@ -478,7 +500,9 @@ def prompt_output(data: dict, now: float) -> dict:
             lower_bands(str(session_id), pct, quota, load_config())
         except Exception:
             pass
-    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": line}}
+    budget = advice(pct)
+    text = f"{line}\n{budget}" if budget else line
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}
 
 
 def clear_announced(session_id: str, config: dict[str, Any]) -> None:

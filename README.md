@@ -1,6 +1,7 @@
 # codex-usage-meter
 
-A Codex command hook with two registrations of one script. On `UserPromptSubmit` it injects a usage line into the
+A Codex command hook with two registrations of one script. On `UserPromptSubmit` it injects a usage line (and, from
+25% context, context-budget advice) into the
 model's context (`additionalContext`). On `Stop` it shows a `↳ Hook · ...` message to the human (`systemMessage`):
 a one-off warning when a threshold band was crossed upward, and when the prompt cache goes cold. Codex CLI, TUI and
 the Desktop app all read
@@ -21,6 +22,19 @@ ctx 19.5% (92,684 / 475,000) | 5h 12% (reset: 2h 10m) wk 74% (reset: 1d 17h)
 - Any unexpected error on `UserPromptSubmit` yields `ctx unknown (usage error)`. As long as stdout is writable,
   every path prints one valid JSON object and exits 0 (a closed stdout cannot be reported). `Stop` failures, unknown
   events, input without `hook_event_name` and unparseable input print `{}`.
+
+## Context budget
+
+From 25% context, the injected text continues after the line with advice for every band reached (cumulative), so
+Codex itself says when to compact instead of you watching the percent:
+
+- ≥25%: delegate large reads to subagents and cap tool output.
+- ≥50%: once, at the end of the current step, tell the user `/compact` is advisable after this task.
+- ≥75%: stop at a clean boundary, list in the reply what must survive verbatim (IDs, `file:line`, decisions and their
+  why, the next action), and tell the user to run `/compact`, or `/new` and paste that list.
+
+Codex cannot run `/compact` or `/new` itself; the advice only makes it say so. Nothing is added while the figure is
+unknown.
 
 Figures come from the newest `token_count` events in the session rollout (`transcript_path`), scanned backwards in
 chunks, reading at most the last 16 MiB of the rollout (a side not found there reads as unknown or is omitted).

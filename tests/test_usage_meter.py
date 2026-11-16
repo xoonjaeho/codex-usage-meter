@@ -155,7 +155,30 @@ def test_newest_event_with_null_info_falls_back_to_older_info(tmp_path):
     out, _ = run_hook(tmp_path, {"transcript_path": str(rollout)})
 
     # ctx from the older event, quota from the newest one
-    assert norm(context_of(out)) == "ctx 50.0% (237,500 / 475,000) | 5h 13% (reset: X) wk 74% (reset: X)"
+    line, budget = context_of(out).split("\n", 1)
+    assert norm(line) == "ctx 50.0% (237,500 / 475,000) | 5h 13% (reset: X) wk 74% (reset: X)"
+    assert budget == load_module().advice(50.0)
+
+
+def test_advice_holds_every_band_reached_and_none_below_or_unknown():
+    advice = load_module().advice
+
+    def bands(pct):
+        return [row.split(":")[0] for row in advice(pct).split("\n")[1:]]
+
+    assert advice(None) is None
+    assert advice(24.9) is None
+    assert bands(25) == ["- ≥25%"]
+    assert bands(60) == ["- ≥25%", "- ≥50%"]
+    assert bands(75) == ["- ≥25%", "- ≥50%", "- ≥75%"]
+
+
+def test_advice_leaves_compact_to_the_user_and_asks_for_a_survival_list_at_75():
+    text = load_module().advice(80)
+
+    assert "you cannot run /compact or /new yourself" in text.split("\n")[0]
+    assert "/compact is advisable" in text.split("\n")[2]
+    assert "what must survive verbatim" in text.split("\n")[3]
 
 
 def test_partial_trailing_line_is_skipped(tmp_path):
