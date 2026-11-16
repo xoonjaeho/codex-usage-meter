@@ -141,6 +141,11 @@ Use the absolute interpreter path: the Desktop app is a Store app and its PATH c
 Then trust each registration once (they are trusted separately) via `/hooks` in the TUI, or Settings -> Hooks in the
 Desktop app. Changing the command string changes the trust hash and needs re-trusting; editing the script does not.
 
+An untrusted hook is skipped silently (observed with codex 0.159.2): no usage line, no advice, no warning. If no
+`hook: UserPromptSubmit` / `hook: Stop` line shows under replies after installing, the trust step is missing.
+`codex exec --dangerously-bypass-hook-trust` runs it once without stored trust, which tells a trust problem from a
+broken command.
+
 ## Limits
 
 - On `UserPromptSubmit`, figures are the snapshot from the last completed turn, not the current prompt. On `Stop`
