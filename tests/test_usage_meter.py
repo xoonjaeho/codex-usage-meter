@@ -1138,12 +1138,12 @@ def test_deeply_nested_state_file_is_treated_as_fresh(tmp_path):
     assert norm(out["systemMessage"]) == "⚠ Codex wk usage 82% — pace your usage (reset: X)"
 
 
-# Captured from a codex-tui 0.159.2 rollout; tests rewrite timestamp, turn_id and the usage figures.
+# Shaped like a codex-tui 0.159.2 rollout record (ids are dummies); tests rewrite timestamp, turn_id and the usage figures.
 USAGE_RECORD = (
     '{"timestamp":"2026-11-12T07:59:17.265Z","ordinal":25,"type":"token_usage_record","payload":{"thread_id":'
-    '"01a1cec3-16a2-73c1-9875-8060de0e73c2","turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0","session_id":'
-    '"01a1cec3-16a2-73c1-9875-8060de0e73c2","root_turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0","response_id":'
-    '"resp_03a8a698f9485a76016af571d2136487d0aa4941b11fa82b35","usage":{"input_tokens":22392,"cached_input_tokens":'
+    '"00000000-0000-7000-8000-000000000001","turn_id":"00000000-0000-7000-8000-000000000002","session_id":'
+    '"00000000-0000-7000-8000-000000000001","root_turn_id":"00000000-0000-7000-8000-000000000002","response_id":'
+    '"resp_000000000000000000000000000000000000000000000000000001","usage":{"input_tokens":22392,"cached_input_tokens":'
     '22144,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":0,"total_tokens":22398},'
     '"turn_token_usage":{"input_tokens":22392,"cached_input_tokens":22144,"cache_write_input_tokens":0,'
     '"output_tokens":6,"reasoning_output_tokens":0,"total_tokens":22398},"thread_token_usage":{"input_tokens":44715,'
@@ -1152,7 +1152,7 @@ USAGE_RECORD = (
 )
 TASK_STARTED = (
     '{"timestamp":"2026-11-12T07:59:05.904Z","ordinal":18,"type":"event_msg","payload":{"type":"task_started",'
-    '"turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0","root_turn_id":"01a1cec4-7c69-7cd3-b447-101658d43ca0",'
+    '"turn_id":"00000000-0000-7000-8000-000000000002","root_turn_id":"00000000-0000-7000-8000-000000000002",'
     '"started_at":1794470345,"model_context_window":475000,"collaboration_mode_kind":"default"}}'
 )
 CACHE_CONFIG = {"cache_warm_message": "warm {until} {ttl}", "cache_cold_message": "cold {idle} {ttl}"}
