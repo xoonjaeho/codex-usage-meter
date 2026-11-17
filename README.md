@@ -29,8 +29,8 @@ From 25% context, the injected text continues after the line with advice for eve
 Codex itself says when to compact instead of you watching the percent:
 
 - ≥25%: delegate large reads to subagents and cap tool output.
-- ≥50%: once, at the end of the current step, tell the user `/compact` is advisable after this task.
-- ≥75%: stop at a clean boundary, list in the reply what must survive verbatim (IDs, `file:line`, decisions and their
+- ≥50%: at the end of the current step, tell the user `/compact` is advisable after this task, once per conversation.
+- ≥75% (replaces the 50% advice): stop at a clean boundary, list in the reply what must survive verbatim (IDs, `file:line`, decisions and their
   why, the next action), and tell the user to run `/compact`, or `/new` and paste that list.
 
 Codex cannot run `/compact` or `/new` itself; the advice only makes it say so. Nothing is added while the figure is

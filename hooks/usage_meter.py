@@ -322,11 +322,12 @@ def context_percent(info: dict) -> tuple[float, int, int]:
 # Only the user can run /compact or /new, so the advice ends in telling them.
 ADVICE = [
     (25, "delegate large reads to subagents and cap tool output instead of reading whole files."),
-    (50, "once, at the end of the current step, tell the user /compact is advisable after this task. Keep working."),
+    (50, "at the end of the current step, tell the user /compact is advisable after this task. Skip this if you already said it in this conversation."),
     (
         75,
-        "stop at a clean boundary, list in your reply what must survive verbatim (IDs, file:line, decisions and their "
-        "why, the next action), and tell the user once to run /compact, or /new and paste that list.",
+        "this replaces the ≥50% advice: stop at a clean boundary, list in your reply what must survive verbatim (IDs, "
+        "file:line, decisions and their why, the next action), and tell the user to run /compact, or /new and paste "
+        "that list. Skip the telling if you already did it in this conversation.",
     ),
 ]
 ADVICE_HEADER = "Context budget (from the ctx line above; you cannot run /compact or /new yourself):"
