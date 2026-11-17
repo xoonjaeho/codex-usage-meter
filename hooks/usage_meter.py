@@ -360,7 +360,7 @@ def build_line(info: dict | None, limits: dict | None, now: float) -> tuple[str,
         label = quota_label(window_info)
         used = window_info["used_percent"]
         quota[label] = (used, reset_text(window_info.get("resets_at"), now) or "unknown")
-        parts.append(f"{label} {round(used)}%{format_reset(window_info.get('resets_at'), now)}")
+        parts.append(f"{label} {math.floor(used)}%{format_reset(window_info.get('resets_at'), now)}")
     return (f"{ctx} | {' '.join(parts)}" if parts else ctx), pct, quota
 
 
@@ -451,7 +451,7 @@ def crossed_messages(state: dict, pct: float | None, quota: Quota, config: dict[
         warnings = config["quota_warnings"]
         band = band_of(used, thresholds_of(warnings))
         if band > state["quota"].get(label, 0):
-            values = {"pct": str(round(used)), "band": format_band(band), "window": label, "reset": reset}
+            values = {"pct": str(math.floor(used)), "band": format_band(band), "window": label, "reset": reset}
             messages.append(render(message_for(band, warnings), values))
         state["quota"][label] = band
     return messages

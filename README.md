@@ -106,7 +106,7 @@ Optional file `{CODEX_HOME or ~/.codex}/codex-usage-meter.json`, one JSON object
 - `context_warnings` / `quota_warnings`: a non-empty list of `{"at", "message"}` objects. `at` is a number from 1 to
   100 (percent, not boolean) and strictly ascending; `message` is a non-empty string. A message fires when the figure
   first reaches its `at`.
-- Placeholders: `{pct}` (context with one decimal, quota rounded), `{band}` (the `at` that fired), and for quota
+- Placeholders: `{pct}` (context with one decimal, quota rounded down), `{band}` (the `at` that fired), and for quota
   messages `{window}` (`5h`, `wk` or `{N}m`) and `{reset}` (the countdown shown in the line, e.g. `2h 10m`, `1d 17h`,
   `passed`, or `unknown`). Unknown placeholders stay as written; context messages only know `{pct}` and `{band}`.
 - `cache_notices`: `false` drops both prompt cache lines; band warnings are unaffected.
