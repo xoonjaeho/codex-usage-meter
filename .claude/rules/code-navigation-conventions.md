@@ -17,6 +17,7 @@ Two user-scope MCP servers answer code questions: `serena` (symbol-level, langua
 
 ## Where they are available
 - Both: main session, background `Agent` subagents, codex.
+- Both load at session start (`alwaysLoad: true` on each server in `~/.claude.json`): call them directly, no ToolSearch step. Without that key Claude Code defers their tools and they go unused.
 - Custom agent types get only what their `tools:` list names — `explore`, `verify-claims` and `adversarial-review` carry Serena lookups and graph queries; `synthesize-reviews` carries neither — hand it the results instead.
 - Background `Agent` subagents do not get the built-in `LSP` tool; Serena covers those lookups.
 - Delegation packets doing code lookup name the tool and the absolute project path.
